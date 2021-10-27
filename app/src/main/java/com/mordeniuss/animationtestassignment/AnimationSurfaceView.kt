@@ -15,7 +15,7 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlin.reflect.KSuspendFunction0
-import kotlin.reflect.KSuspendFunction1
+import kotlin.reflect.KSuspendFunction2
 
 class AnimationSurfaceView : SurfaceView, SurfaceHolder.Callback {
     constructor(context: Context) : super(context)
@@ -32,7 +32,7 @@ class AnimationSurfaceView : SurfaceView, SurfaceHolder.Callback {
     private var animationJob: Job? = null
     private var renderJob: Job? = null
 
-    private var onBitmapReadyListener: KSuspendFunction1<Bitmap, Unit>? = null
+    private var onBitmapReadyListener: KSuspendFunction2<Bitmap, Int, Unit>? = null
     private var onFinishListener: KSuspendFunction0<Unit>? = null
 
     private var textY = 0f
@@ -56,7 +56,7 @@ class AnimationSurfaceView : SurfaceView, SurfaceHolder.Callback {
     }
 
 
-    fun init(onBitmapReady: KSuspendFunction1<Bitmap, Unit>, onFinish: KSuspendFunction0<Unit>) {
+    fun init(onBitmapReady: KSuspendFunction2<Bitmap, Int, Unit>, onFinish: KSuspendFunction0<Unit>) {
         onBitmapReadyListener = onBitmapReady
         onFinishListener = onFinish
     }
@@ -75,7 +75,7 @@ class AnimationSurfaceView : SurfaceView, SurfaceHolder.Callback {
             mutex.withLock {}
             calculate(i)
             draw()
-            takeFrame()
+            takeFrame(i)
         }
     }
 
@@ -100,15 +100,15 @@ class AnimationSurfaceView : SurfaceView, SurfaceHolder.Callback {
         textX = 0f
     }
 
-    private suspend fun takeFrame() {
+    private suspend fun takeFrame(frameIndex: Int) {
         val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         mutex.lock()
-        PixelCopy.request(this, bitmap, { onBitmapReady(bitmap) }, Handler(Looper.getMainLooper()))
+        PixelCopy.request(this, bitmap, { onBitmapReady(bitmap, frameIndex) }, Handler(Looper.getMainLooper()))
     }
 
-    private fun onBitmapReady(bitmap: Bitmap) {
+    private fun onBitmapReady(bitmap: Bitmap, frameIndex: Int) {
         renderJob = scope.launch {
-            onBitmapReadyListener?.let { it(bitmap) }
+            onBitmapReadyListener?.let { it(bitmap, frameIndex) }
             mutex.unlock()
         }
     }
