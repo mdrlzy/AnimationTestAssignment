@@ -9,16 +9,19 @@ import android.widget.Button
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.*
+import kotlin.time.ExperimentalTime
 
+@ExperimentalTime
 class MainActivity : AppCompatActivity() {
     private lateinit var animationSurfaceView: AnimationSurfaceView
     private lateinit var renderBtn: Button
     private var lastVideoPath: String? = null
-    private val recorder = Recorder()
+    private val recorder = Recorder(::onFinish, ::onFramesCollected, lifecycleScope)
 
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -39,18 +42,21 @@ class MainActivity : AppCompatActivity() {
             ActivityCompat.requestPermissions(this,
                 listOf(Manifest.permission.WRITE_EXTERNAL_STORAGE).toTypedArray(), 0);
         }
+        animationSurfaceView.init(recorder::onBitmapReady, lifecycleScope)
     }
 
     private fun onRenderBtnClick() {
-        animationSurfaceView.init(recorder::onBitmapReady, ::onFinish)
         renderBtn.isEnabled = false
         recorder.prepare(outputFile())
-        animationSurfaceView.startAnimation()
+        recorder.record()
+        animationSurfaceView.record()
     }
 
+    private fun onFramesCollected() {
+        animationSurfaceView.stopRecord()
+    }
 
-    private suspend fun onFinish() = withContext(Dispatchers.IO)  {
-        recorder.release()
+    private suspend fun onFinish()  {
         withContext(Dispatchers.Main) { renderBtn.isEnabled = true }
         openVideo()
     }

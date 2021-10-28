@@ -5,47 +5,114 @@ import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.media.MediaMuxer
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
+import kotlinx.coroutines.*
+import timber.log.Timber
+import kotlin.reflect.KSuspendFunction0
 
-class Recorder {
+class Recorder(
+    private val onFinish: KSuspendFunction0<Unit>,
+    private val onFramesCollected: () -> Unit,
+    private val scope: CoroutineScope
+) {
     private val bufferInfo = MediaCodec.BufferInfo()
     private var videoTrackIndex = 0
 
-    private val bitsPerPixel = 0.25
+    private val bitsPerPixel = 32
     private val TIMEOUT_USEC = 5000L
-    private val bitRate = (bitsPerPixel * Config.FPS * Config.VIDEO_RES_HEIGHT * Config.VIDEO_RES_WIDTH).toInt()
+    private val bitRate =
+        bitsPerPixel * Config.FPS * Config.VIDEO_RES_HEIGHT * Config.VIDEO_RES_WIDTH
     private val mimeType = "video/avc"
-    
+
+    private var expectedFrameIndex = 0
+    private var readyBitmaps = mutableMapOf<Int, Bitmap>()
+    private var isFramesAwait = false
+    private var recordJob: Job? = null
+
     private lateinit var codec: MediaCodec
     private lateinit var format: MediaFormat
     private lateinit var muxer: MediaMuxer
 
     fun prepare(outputFile: String) {
         codec = MediaCodec.createEncoderByType(mimeType)
-        format = MediaFormat.createVideoFormat(mimeType, Config.VIDEO_RES_WIDTH, Config.VIDEO_RES_HEIGHT)
+        format =
+            MediaFormat.createVideoFormat(mimeType, Config.VIDEO_RES_WIDTH, Config.VIDEO_RES_HEIGHT)
         format.setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
         format.setInteger(MediaFormat.KEY_FRAME_RATE, Config.FPS)
-        format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
+        format.setInteger(
+            MediaFormat.KEY_COLOR_FORMAT,
+            MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible
+        )
         format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
         codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
         muxer = MediaMuxer(outputFile, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
         codec.start()
     }
 
-    suspend fun onBitmapReady(bitmap: Bitmap, frameIndex: Int): Unit = withContext(Dispatchers.IO) {
+    fun record() {
+        isFramesAwait = true
+        expectedFrameIndex = 0
+        recordJob = scope.launch {
+            startRecordLoop()
+        }
+    }
+
+    fun onBitmapReady(bitmap: Bitmap, frameIndex: Int) {
+        Timber.d("$frameIndex bitmap ready")
+        if (isFramesAwait) {
+            readyBitmaps[frameIndex] = bitmap
+        }
+
+        if (frameIndex == Config.FRAMES_IN_ANIMATION) {
+            isFramesAwait = false
+            onFramesCollected()
+        }
+    }
+
+    private suspend fun startRecordLoop() = withContext(Dispatchers.Default) {
+        while (isActive) {
+            val bitmap = readyBitmaps[expectedFrameIndex]
+            bitmap?.let {
+                Timber.d("process $expectedFrameIndex bitmap")
+                handleBitmap(expectedFrameIndex, bitmap)
+                readyBitmaps.remove(expectedFrameIndex)
+                expectedFrameIndex++
+            }
+            if (expectedFrameIndex == Config.FRAMES_IN_ANIMATION)
+                release()
+        }
+    }
+
+    private suspend fun release() = withContext(Dispatchers.IO) {
+        isFramesAwait = false
+        codec.stop()
+        codec.release()
+
+        muxer.stop()
+        muxer.release()
+        readyBitmaps.clear()
+        onFinish()
+        recordJob!!.cancelAndJoin()
+    }
+
+    private fun handleBitmap(frameIndex: Int, bitmap: Bitmap) {
         val inputBufId = codec.dequeueInputBuffer(TIMEOUT_USEC)
         if (inputBufId >= 0) {
             val input = getNV21(bitmap)
             val byteBuffer = codec.getInputBuffer(inputBufId)!!
             byteBuffer.clear()
             byteBuffer.put(input)
-            codec.queueInputBuffer(inputBufId, 0, input.size, computePresentationTime(frameIndex), 0)
+            codec.queueInputBuffer(
+                inputBufId,
+                0,
+                input.size,
+                computePresentationTime(frameIndex),
+                0
+            )
         }
 
         val outputBufId = codec.dequeueOutputBuffer(bufferInfo, TIMEOUT_USEC)
         if (outputBufId >= 0) {
-            val encodedData = codec.getOutputBuffer(outputBufId) ?: return@withContext
+            val encodedData = codec.getOutputBuffer(outputBufId) ?: return
             encodedData.position(bufferInfo.offset)
             encodedData.limit(bufferInfo.offset + bufferInfo.size)
             muxer.writeSampleData(videoTrackIndex, encodedData, bufferInfo)
@@ -57,14 +124,6 @@ class Recorder {
         }
     }
 
-    suspend fun release() = withContext(Dispatchers.IO)  {
-        codec.stop()
-        codec.release()
-
-        muxer.stop()
-        muxer.release()
-    }
-
     private fun computePresentationTime(frameIndex: Int): Long {
         return (frameIndex * 1000000 / Config.FPS).toLong()
     }
@@ -74,7 +133,15 @@ class Recorder {
             Bitmap.createScaledBitmap(bitmap, Config.VIDEO_RES_WIDTH, Config.VIDEO_RES_HEIGHT, true)
         val size = Config.VIDEO_RES_WIDTH * Config.VIDEO_RES_HEIGHT
         val argb = IntArray(size)
-        scaled.getPixels(argb, 0, Config.VIDEO_RES_WIDTH, 0, 0, Config.VIDEO_RES_WIDTH, Config.VIDEO_RES_HEIGHT)
+        scaled.getPixels(
+            argb,
+            0,
+            Config.VIDEO_RES_WIDTH,
+            0,
+            0,
+            Config.VIDEO_RES_WIDTH,
+            Config.VIDEO_RES_HEIGHT
+        )
         scaled.recycle()
         val yuv = ByteArray(size * 3 / 2)
         encodeYUV420SP(yuv, argb)

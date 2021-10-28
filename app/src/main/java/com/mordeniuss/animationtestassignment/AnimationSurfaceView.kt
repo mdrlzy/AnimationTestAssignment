@@ -2,6 +2,7 @@ package com.mordeniuss.animationtestassignment
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.os.Handler
@@ -14,9 +15,10 @@ import android.view.SurfaceView
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import kotlin.reflect.KSuspendFunction0
-import kotlin.reflect.KSuspendFunction2
+import kotlin.time.Duration
+import kotlin.time.ExperimentalTime
 
+@ExperimentalTime
 class AnimationSurfaceView : SurfaceView, SurfaceHolder.Callback {
     constructor(context: Context) : super(context)
     constructor(context: Context, attrs: AttributeSet?) : super(context, attrs)
@@ -26,14 +28,19 @@ class AnimationSurfaceView : SurfaceView, SurfaceHolder.Callback {
         defStyleAttr
     )
 
+    private val tickTime = ((1f/Config.FPS) * 1000000000).toLong()
+    private var startAnimationTickTime = -1L
+    private var delayTime = -1L
 
     private val mutex = Mutex()
-    private var scope = CoroutineScope(Dispatchers.Default)
+    private lateinit var scope: CoroutineScope
     private var animationJob: Job? = null
-    private var renderJob: Job? = null
 
-    private var onBitmapReadyListener: KSuspendFunction2<Bitmap, Int, Unit>? = null
-    private var onFinishListener: KSuspendFunction0<Unit>? = null
+    private lateinit var onBitmapReadyListener: (Bitmap, Int) -> Unit
+
+    private var localFrameIndex = 0
+    private var recordFrameIndex = 0
+    private var isRecording = false
 
     private var textY = 0f
     private var textX = 0f
@@ -42,7 +49,9 @@ class AnimationSurfaceView : SurfaceView, SurfaceHolder.Callback {
         holder.addCallback(this)
     }
 
-    override fun surfaceCreated(holder: SurfaceHolder) {}
+    override fun surfaceCreated(holder: SurfaceHolder) {
+        startAnimation()
+    }
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
         textY = height / 2f
@@ -51,37 +60,53 @@ class AnimationSurfaceView : SurfaceView, SurfaceHolder.Callback {
     override fun surfaceDestroyed(holder: SurfaceHolder) {
         runBlocking {
             animationJob?.cancelAndJoin()
-            renderJob?.cancelAndJoin()
         }
     }
 
 
-    fun init(onBitmapReady: KSuspendFunction2<Bitmap, Int, Unit>, onFinish: KSuspendFunction0<Unit>) {
+    fun init(onBitmapReady: (Bitmap, Int) -> Unit, scope: CoroutineScope) {
         onBitmapReadyListener = onBitmapReady
-        onFinishListener = onFinish
+        this.scope = scope
     }
 
-    fun startAnimation() {
-        animationJob = scope.launch {
-            resetAnimationProperties()
+    private fun startAnimation() {
+        animationJob = scope.launch(Dispatchers.Default) {
             runAnimationLoop()
-            mutex.withLock {}
-            onFinishListener?.let { it() }
         }
     }
 
-    private suspend fun runAnimationLoop() {
-        for (i in 0..Config.FRAMES_IN_ANIMATION) {
-            mutex.withLock {}
-            calculate(i)
+    fun record() {
+        recordFrameIndex = 0
+        isRecording = true
+    }
+
+    fun stopRecord() {
+        isRecording = false
+    }
+
+    private suspend fun runAnimationLoop() = withContext(Dispatchers.Default) {
+        while (isActive) {
+            startAnimationTickTime = System.nanoTime()
+            if (localFrameIndex > Config.FRAMES_IN_CYCLE)
+                localFrameIndex = 0
+
+            calculate()
             draw()
-            takeFrame(i)
+
+            if (isRecording) {
+                takeFrame(recordFrameIndex)
+                recordFrameIndex++
+                mutex.withLock {}
+            }
+            localFrameIndex++
+
+            delayTime = tickTime - (System.nanoTime() - startAnimationTickTime)
+            delay(Duration.Companion.nanoseconds(delayTime))
         }
     }
 
-    private fun calculate(animationIndex: Int) {
-        val cycleIndex = animationIndex % Config.FRAMES_IN_CYCLE
-        val widthPercent = cycleIndex / Config.FRAMES_IN_CYCLE
+    private fun calculate() {
+        val widthPercent = localFrameIndex.toFloat() / Config.FRAMES_IN_CYCLE
         textX = widthPercent * width
     }
 
@@ -90,14 +115,10 @@ class AnimationSurfaceView : SurfaceView, SurfaceHolder.Callback {
         textPaint.textAlign = Paint.Align.CENTER
         textPaint.color = Color.WHITE
         textPaint.textSize = 20f * resources.displayMetrics.scaledDensity
-        val canvas = holder.lockCanvas()
-        canvas.drawColor(Color.GRAY)
-        canvas.drawText("Hello World", textX, textY, textPaint)
-        holder.unlockCanvasAndPost(canvas)
-    }
-
-    private fun resetAnimationProperties() {
-        textX = 0f
+        val canvas: Canvas? = holder.lockCanvas()
+        canvas?.drawColor(Color.GRAY)
+        canvas?.drawText("Hello World", textX, textY, textPaint)
+        canvas?.let { holder.unlockCanvasAndPost(canvas) }
     }
 
     private suspend fun takeFrame(frameIndex: Int) {
@@ -107,9 +128,9 @@ class AnimationSurfaceView : SurfaceView, SurfaceHolder.Callback {
     }
 
     private fun onBitmapReady(bitmap: Bitmap, frameIndex: Int) {
-        renderJob = scope.launch {
-            onBitmapReadyListener?.let { it(bitmap, frameIndex) }
+        scope.launch {
             mutex.unlock()
+            onBitmapReadyListener(bitmap, frameIndex)
         }
     }
 
